@@ -1,0 +1,11 @@
+# ---- MT5 + data core ------------------------------------------------
+MetaTrader5>=5.0.45
+pandas>=2.0.0
+numpy>=1.24.0
+pyarrow>=14.0.0        # parquet write/read (drop if you only use CSV)
+
+# ---- timezone handling ---------------------------------------------
+tzdata>=2024.1         # Windows needs this for America/New_York via zoneinfo
+
+# ---- optional, but you will want these next -------------------------
+matplotlib>=3.7.0      # quick plots of bars / sessions
