@@ -1,0 +1,26 @@
+# Virtual environments
+.venv/
+.venv312/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Environment variables / secrets
+.env
+.env.*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Results (usually don't commit outputs)
+src/results/
+*.log
