@@ -1,22 +1,14 @@
-# src/labels/fractals.py
-from ast import Add
-from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Dict
-from datetime import datetime, timedelta
-from enum import Enum
+from __future__ import annotations
 
-from matplotlib import text
-
-
-class BarState(Enum):
-    CLOSED = "closed"
-    AGGREGATED = "aggregated"
-    PARTIAL = "partial"
-    LIVE = "live"
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Sequence
 
 
 @dataclass
 class Candle:
+    index: int  # continuous sequence number — proves the stream has no gaps
+    open_time: datetime
     symbol: str
     timeframe: str
     unix_time: int
@@ -27,8 +19,57 @@ class Candle:
     low: float
     close: float
     tick_volume: int
+    source_indices: tuple[int, ...] = ()
 
 
+class Fractal:
+    """Period-1 (3-candle) fractal detector. Input candles are already closed."""
+
+    @staticmethod
+    def is_high(candles: Sequence[Candle], idx: int) -> bool:
+        """Swing high: curr.high > left.high and curr.high > right.high."""
+        if idx <= 0 or idx >= len(candles) - 1: return False
+        return candles[idx].high > candles[idx - 1].high and candles[idx].high > candles[idx + 1].high
+
+    @staticmethod
+    def is_low(candles: Sequence[Candle], idx: int) -> bool:
+        """Swing low: curr.low < left.low and curr.low < right.low."""
+        if idx <= 0 or idx >= len(candles) - 1: return False
+        return candles[idx].low < candles[idx - 1].low and candles[idx].low < candles[idx + 1].low
+
+    @classmethod
+    def detect_highs(cls, candles: Sequence[Candle]) -> list[int]:
+        """All confirmed swing high indices."""
+        return [i for i in range(1, len(candles) - 1) if cls.is_high(candles, i)]
+
+    @classmethod
+    def detect_lows(cls, candles: Sequence[Candle]) -> list[int]:
+        """All confirmed swing low indices."""
+        return [i for i in range(1, len(candles) - 1) if cls.is_low(candles, i)]
+
+
+
+
+
+
+
+\
+
+
+
+
+
+'''
+
+
+
+
+class BarState(Enum):
+    CLOSED = "closed"
+    AGGREGATED = "aggregated"
+    PARTIAL = "partial"
+    LIVE = "live"
+    
 @dataclass
 class FractalNode:
     node_id: str
@@ -55,52 +96,9 @@ class CandleNode:
     children_by_tf: Dict[str, List[str]] = field(default_factory=dict)
 
 
-# ============================================================================
-# FRACTAL DETECTION - PURE LOGIC (No state, no streaming)
-# ============================================================================
 
-class FractalLogic:
-    """Pure fractal detection logic. No state. Reusable."""
-    
-    @staticmethod
-    def is_high(candles: List[Candle], idx: int, period: int) -> bool:
-        """Check if candle at idx is a fractal high"""
-        curr = candles[idx]
-        for j in range(1, period + 1):
-            if curr.high <= candles[idx - j].high:
-                return False
-            if curr.high <= candles[idx + j].high:
-                return False
-        return True
-    
-    @staticmethod
-    def is_low(candles: List[Candle], idx: int, period: int) -> bool:
-        """Check if candle at idx is a fractal low"""
-        curr = candles[idx]
-        for j in range(1, period + 1):
-            if curr.low >= candles[idx - j].low:
-                return False
-            if curr.low >= candles[idx + j].low:
-                return False
-        return True
-    
-    @staticmethod
-    def possible_high(candles: List[Candle], idx: int, period: int) -> bool:
-        """Check left side only (potential fractal high)"""
-        curr = candles[idx]
-        for j in range(1, period + 1):
-            if curr.high <= candles[idx - j].high:
-                return False
-        return True
-    
-    @staticmethod
-    def possible_low(candles: List[Candle], idx: int, period: int) -> bool:
-        """Check left side only (potential fractal low)"""
-        curr = candles[idx]
-        for j in range(1, period + 1):
-            if curr.low >= candles[idx - j].low:
-                return False
-        return True
+
+
 
 
 # ============================================================================
@@ -482,7 +480,7 @@ class SwingPairer:
 
 
 
-''''
+
 # logic/detectors/fractal.py
 from dataclasses import dataclass
 from datetime import datetime
@@ -537,7 +535,7 @@ def detect_fractal(
     return None
 
 
-'''
+
 
 
 
@@ -858,3 +856,6 @@ If those five pass, the lineage layer is trustworthy and you can bolt on bar-cla
 **Next decision point:** once this is running for fractals, do you want the `INTERIOR` edges to be kept permanently (audit + query, storage grows) or pruned on `SEALED` (storage bounded, historical queries need recomputation)? That's the one storage tradeoff we haven't fixed yet.
 
 """   
+
+
+'''
