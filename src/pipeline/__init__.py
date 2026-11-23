@@ -1,16 +1,12 @@
 # src/pipeline/__init__.py
 """
-Pipeline package init.
+Pipeline package init. Configures logging once, on first import.
 
-Configures logging once — the first time *any* src.pipeline.* module is
-imported. All pipeline modules just do:
+No other module should call logging.basicConfig() or add handlers.
+All pipeline modules use:
 
     import logging
     log = logging.getLogger(__name__)
-
-…and their lines land in src/logs/pipeline.log and on stderr.
-
-No module below should call logging.basicConfig() or add handlers.
 """
 from __future__ import annotations
 

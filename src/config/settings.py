@@ -26,6 +26,17 @@ class RiskSettings:
     rr_trend_aligned: float = 2.5       # reward:risk when trend-aligned
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────
+from pathlib import Path
+
+LOG_DIR: Path = Path(__file__).resolve().parents[2] / "src" / "logs"
+LOG_FILE: Path = LOG_DIR / "pipeline.log"
+LOG_LEVEL: str = "INFO"
+LOG_FORMAT: str = "%(asctime)s  %(levelname)-7s  %(name)-24s  %(message)s"
+LOG_DATEFMT: str = "%Y-%m-%d %H:%M:%S"
+
 # ═══════════════════════════════════════════════════════════════════
 # Position management (BE / trail / breach)
 # ═══════════════════════════════════════════════════════════════════

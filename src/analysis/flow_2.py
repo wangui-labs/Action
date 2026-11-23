@@ -4,12 +4,13 @@ Flow 2 — consolidation detection on 15m and 4h swings from flow_0.
 
 Tuned for a 3-digit gold quote (XAUUSDm with `point=0.001`, `digits=3`):
 
-    pip_size          = 0.01   # 1 retail pip = 10 points = $0.01
-    MIN_SWING_PIPS    15m → 800   (~$8.00, the p10 of real 15m swings)
-                      4h  → 3000  (~$30.00, below the p10 of 4h swings)
-    max_range_pips    15m → 3000  (~$30 max consolidation width)
-                      4h  → 12000 (~$120 max consolidation width)
-    min_candles_inside = 3        # matches 3-candle fractal family scale
+    pip_size          = 0.01    # 1 retail pip = 10 points = $0.01
+    MIN_SWING_PIPS    15m → 800    (~$8.00, the p10 of real 15m swings)
+                      4h  → 3000   (~$30.00, below the p10 of 4h swings)
+    max_range_pips    15m → 3000   (~$30 max consolidation width)
+                      4h  → 12000  (~$120 max consolidation width)
+    min_candles      15m → 6 interior + 2 swing = 8 candles total
+                      4h  → 4 interior + 2 swing = 6 candles total
 
     from src.analysis.flow_0 import label_bars
     from src.analysis.flow_2 import find_consolidations, find_consolidations_multi
@@ -35,31 +36,29 @@ log = logging.getLogger(__name__)
 
 FLOW_TFS: tuple[str, ...] = ("15m", "4h")
 
-# Retail gold pip for 3-digit brokers: 1 pip = 10 points = $0.01 price.
 DEFAULT_PIP_SIZE: float = 0.01
 
-# Real XAUUSDm swing sizes (measured), converted to pips at pip_size=0.01:
-#   15m  p10 swing ≈ $8.59   →  859 pips   → use 800 as the floor
-#    4h  p10 swing ≈ $33.80  → 3380 pips   → use 3000 as the floor
 MIN_SWING_PIPS: dict[str, float] = {
     "15m": 800.0,
     "4h":  3000.0,
 }
 DEFAULT_MIN_SWING_PIPS = 800.0
 
-# Max consolidation width — must exceed the median swing size or nothing
-# will ever qualify. Set to ~2× the median swing of each TF.
-#   15m  median swing ≈ $16.62  → allow up to $30 = 3000 pips
-#    4h  median swing ≈ $56.95  → allow up to $120 = 12000 pips
 MAX_RANGE_PIPS_BY_TF: dict[str, float] = {
     "15m": 3000.0,
     "4h":  12000.0,
     "default": 3000.0,
 }
 
-# Minimum candles with bodies fully inside the range for it to count.
-# Was 8 — far too strict for 3-candle fractals. 3 is the meaningful floor.
-DEFAULT_MIN_CANDLES_INSIDE = 3
+# Number of *interior* candles whose body must be fully inside the range.
+# The two swing fractal candles are at the extremes (not counted as
+# "inside") — so total candles = min_inside + 2.
+MIN_CANDLES_INSIDE_BY_TF: dict[str, int] = {
+    "15m": 6,   # 6 interior + 2 swing = 8 total
+    "4h":  4,   # 4 interior + 2 swing = 6 total
+    "default": 6,
+}
+DEFAULT_MIN_CANDLES_INSIDE = 6
 
 
 @dataclass
@@ -87,19 +86,34 @@ class Flow2:
         self,
         pip_size: float = DEFAULT_PIP_SIZE,
         max_range_pips: float | dict[str, float] | None = None,
-        min_candles_inside: int = DEFAULT_MIN_CANDLES_INSIDE,
+        min_candles_inside: int | dict[str, int] | None = None,
         min_swing_pips_by_tf: Optional[dict[str, float]] = None,
     ):
         if pip_size <= 0:
             raise ValueError(f"pip_size must be > 0, got {pip_size}")
         self.pip_size = pip_size
         self.min_swing_pips = min_swing_pips_by_tf or MIN_SWING_PIPS
-        if max_range_pips is None:
-            max_range_pips = MAX_RANGE_PIPS_BY_TF
-        self.detector = ConsolidationDetector(
-            pip_size=pip_size,
-            max_range_pips=max_range_pips,
-            min_candles_inside=min_candles_inside,
+        self._max_range_pips = (
+            max_range_pips if max_range_pips is not None
+            else MAX_RANGE_PIPS_BY_TF
+        )
+        self._min_candles_cfg = (
+            min_candles_inside if min_candles_inside is not None
+            else MIN_CANDLES_INSIDE_BY_TF
+        )
+
+    def _min_inside_for(self, tf: str) -> int:
+        if isinstance(self._min_candles_cfg, int):
+            return self._min_candles_cfg
+        return self._min_candles_cfg.get(
+            tf, self._min_candles_cfg.get("default", DEFAULT_MIN_CANDLES_INSIDE)
+        )
+
+    def _detector_for(self, tf: str) -> ConsolidationDetector:
+        return ConsolidationDetector(
+            pip_size=self.pip_size,
+            max_range_pips=self._max_range_pips,
+            min_candles_inside=self._min_inside_for(tf),
         )
 
     def run(
@@ -122,10 +136,15 @@ class Flow2:
             return result
 
         min_pips = self.min_swing_pips.get(tf, DEFAULT_MIN_SWING_PIPS)
+        min_inside = self._min_inside_for(tf)
         log.info(
-            "FLOW2 start  tf=%s  nodes=%d  pairs=%d  min_swing_pips=%.1f  pip_size=%s",
-            tf, len(flow.nodes), len(flow.pairs), min_pips, self.pip_size,
+            "FLOW2 start  tf=%s  nodes=%d  pairs=%d  min_swing_pips=%.1f  "
+            "min_inside=%d  pip_size=%s",
+            tf, len(flow.nodes), len(flow.pairs), min_pips,
+            min_inside, self.pip_size,
         )
+
+        detector = self._detector_for(tf)
 
         for pair in flow.pairs:
             n1, n2 = pair.start, pair.end
@@ -145,7 +164,7 @@ class Flow2:
                 continue
 
             try:
-                rec = self.detector.detect(candles, n1, n2)
+                rec = detector.detect(candles, n1, n2)
             except Exception as e:
                 result.skipped_other += 1
                 log.warning(
@@ -245,6 +264,7 @@ __all__ = [
     "DEFAULT_PIP_SIZE",
     "MIN_SWING_PIPS",
     "MAX_RANGE_PIPS_BY_TF",
+    "MIN_CANDLES_INSIDE_BY_TF",
     "ConsolidationResult",
     "Flow2",
     "find_consolidations",
