@@ -120,7 +120,8 @@ class Condition1:
         if isinstance(raw, str):
             key = raw.strip().lower()
             if key not in self._SIDE_ALIAS:
-                raise ValueError(f"side must be one of {sorted(self._SIDE_ALIAS)}, got {raw!r}")
+                raise ValueError(f"side must be one of {sorted(self._SIDE_ALIAS)}, "
+                                 f"got {raw!r}")
             return self._SIDE_ALIAS[key]
         return Side.from_mt5(int(raw))
 
@@ -136,8 +137,9 @@ class Condition1:
         per = auto_trade_config.get_settings(symbol).get("target_risk_usd")
         return float(per if per is not None else settings.risk.target_risk_usd)
 
-    # ── dollar-risk formula (was condition_00) ──────────────────────
-    def dollar_risk_points(self, risk_usd: float, lot: float, symbol: str) -> Optional[float]:
+    # ── dollar-risk formula ─────────────────────────────────────────
+    def dollar_risk_points(self, risk_usd: float, lot: float,
+                           symbol: str) -> Optional[float]:
         info = self._info(symbol)
         denom = info.tick_value * max(lot, 1e-9)
         if denom <= 0:
@@ -145,7 +147,7 @@ class Condition1:
         pts = risk_usd / denom
         return min(pts, self.max_sl_points) if self.max_sl_points else pts
 
-    # ── SL sizing dispatch (dollar-risk only) ───────────────────────
+    # ── SL sizing dispatch ──────────────────────────────────────────
     def _sl_points_for(self, lot: float, symbol: str) -> float:
         pts = self.dollar_risk_points(self._risk_usd(symbol), lot, symbol)
         if pts is None:
@@ -153,16 +155,19 @@ class Condition1:
         return pts
 
     # ── SL / TP construction ────────────────────────────────────────
-    def _stop(self, entry: float, side: Side, sl_points: float, symbol: str) -> StopLoss:
+    def _stop(self, entry: float, side: Side, sl_points: float,
+              symbol: str) -> StopLoss:
         info = self._info(symbol)
         price = entry - self._points_to_price(sl_points, info, side)
         return StopLoss(price=round(price, info.digits), entry=entry, side=side,
                         points=round(sl_points, 1))
 
-    def _target(self, entry: float, side: Side, tp_points: float, symbol: str) -> TakeProfit:
+    def _target(self, entry: float, side: Side, tp_points: float,
+                symbol: str) -> TakeProfit:
         info = self._info(symbol)
         price = entry + self._points_to_price(tp_points, info, side)
-        return TakeProfit(price=round(price, info.digits), points=round(tp_points, 1))
+        return TakeProfit(price=round(price, info.digits),
+                          points=round(tp_points, 1))
 
     def _rr(self, trend_aligned: bool, symbol: Optional[str] = None) -> float:
         key = "rr_trend_aligned" if trend_aligned else "rr_default"
@@ -170,7 +175,8 @@ class Condition1:
             per = auto_trade_config.get_settings(symbol)
             if key in per:
                 return float(per[key])
-        return settings.risk.rr_trend_aligned if trend_aligned else settings.risk.rr_default
+        return (settings.risk.rr_trend_aligned if trend_aligned
+                else settings.risk.rr_default)
 
     # ═══════════════════════════════════════════════════════════════
     # Public API — sizing / plan
@@ -184,7 +190,8 @@ class Condition1:
             sl_pts = self._sl_points_for(lot, symbol)
             if self.max_sl_points and sl_pts > self.max_sl_points:
                 return False
-            sl_usd = sl_pts * (info.tick_size / info.pip_size) * self._pip_value_per_lot(info) * lot
+            sl_usd = (sl_pts * (info.tick_size / info.pip_size)
+                      * self._pip_value_per_lot(info) * lot)
             return sl_usd <= self._risk_usd(symbol) * 2.0
         except (KeyError, ValueError, PermissionError):
             return False
@@ -225,7 +232,7 @@ class Condition1:
         )
 
     # ═══════════════════════════════════════════════════════════════
-    # Public API — worker-facing calculations (plain values, no objects)
+    # Public API — worker-facing calculations (plain values)
     # ═══════════════════════════════════════════════════════════════
     def plan_for_position(self, pos: dict) -> Optional[dict]:
         """Return {'sl_price','tp_price','sl_points','tp_points'} or None."""
@@ -246,17 +253,21 @@ class Condition1:
         tick = self.marketwatch.tick(pos["symbol"])
         is_long = pos["type"] == 0
         current = tick["bid"] if is_long else tick["ask"]
-        return (is_long and sl_price >= current) or (not is_long and sl_price <= current)
+        return (is_long and sl_price >= current) or (
+            not is_long and sl_price <= current)
 
     def is_tp_breached(self, pos: dict, tp_price: float) -> bool:
         info = self._info(pos["symbol"])
         tick = self.marketwatch.tick(pos["symbol"])
         is_long = pos["type"] == 0
         current = tick["bid"] if is_long else tick["ask"]
-        return (is_long and tp_price <= current) or (not is_long and tp_price >= current)
+        return (is_long and tp_price <= current) or (
+            not is_long and tp_price >= current)
 
-    def widened_sl_price(self, pos: dict, multiple: Optional[float] = None) -> Optional[float]:
-        m = multiple if multiple is not None else settings.position_management.breach_multiple
+    def widened_sl_price(self, pos: dict,
+                         multiple: Optional[float] = None) -> Optional[float]:
+        m = (multiple if multiple is not None
+             else settings.position_management.breach_multiple)
         widened_risk = self._risk_usd(pos["symbol"]) * m
         lot = float(pos.get("volume", 0.0))
         pts = self.dollar_risk_points(widened_risk, lot, pos["symbol"])
@@ -269,17 +280,21 @@ class Condition1:
         distance = pts * info.tick_size
         return current - distance if is_long else current + distance
 
-    def escalated_tp_price(self, pos: dict, multiple: Optional[float] = None) -> Optional[float]:
-        m = multiple if multiple is not None else settings.position_management.tp_breach_multiple
+    def escalated_tp_price(self, pos: dict,
+                           multiple: Optional[float] = None) -> Optional[float]:
+        m = (multiple if multiple is not None
+             else settings.position_management.tp_breach_multiple)
         base_rr = self._rr(False, pos["symbol"])
         escalated_rr = base_rr * m
         lot = float(pos.get("volume", 0.0))
-        sl_pts = self.dollar_risk_points(self._risk_usd(pos["symbol"]), lot, pos["symbol"])
+        sl_pts = self.dollar_risk_points(self._risk_usd(pos["symbol"]), lot,
+                                         pos["symbol"])
         if sl_pts is None:
             return None
         info = self._info(pos["symbol"])
         side = Side.from_mt5(pos["type"])
-        return round(pos["price_open"] + sl_pts * escalated_rr * info.tick_size * side.sign, info.digits)
+        return round(pos["price_open"] + sl_pts * escalated_rr
+                     * info.tick_size * side.sign, info.digits)
 
     def r_multiple(self, pos: dict, price: float) -> float:
         entry = pos["price_open"]
@@ -297,7 +312,8 @@ class Condition1:
         initial = abs(pos["price_open"] - pos["sl"]) if pos["sl"] > 0 else 0.0
         lock = initial * pm.be_lock_pct
         is_long = pos["type"] == 0
-        return round(pos["price_open"] + (lock if is_long else -lock), info.digits)
+        return round(pos["price_open"] + (lock if is_long else -lock),
+                     info.digits)
 
     def trailing_sl(self, pos: dict, price: float) -> Optional[float]:
         pm = settings.position_management
@@ -321,4 +337,14 @@ class Condition1:
 
     def min_stop_distance(self, symbol: str) -> float:
         info = self._info(symbol)
-        return (info.stops_level_points or 10) * info.point * settings.position_management.stops_level_buffer
+        return ((info.stops_level_points or 10) * info.point
+                * settings.position_management.stops_level_buffer)
+
+
+__all__ = [
+    "Condition1",
+    "Side",
+    "StopLoss",
+    "TakeProfit",
+    "TradePlan",
+]

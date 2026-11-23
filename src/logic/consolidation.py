@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Sequence
 
-from .fractals import Candle, FractalNode
-from .fib import FibPlot, FibRatios
+from src.logic.fractals import Candle, FractalNode
+from src.logic.fib import FibPlot, FibRatios
 
 
 @dataclass(frozen=True)
@@ -84,7 +84,6 @@ class ConsolidationRecord:
         }
 
 
-
 class ConsolidationDetector:
     """Two FractalNodes → one ConsolidationRecord. Inclusive candle scan."""
 
@@ -113,7 +112,8 @@ class ConsolidationDetector:
     @staticmethod
     def _ordered(n1: FractalNode, n2: FractalNode) -> tuple[FractalNode, FractalNode]:
         if n1.swing_type == n2.swing_type:
-            raise ValueError(f"need one swing_high and one swing_low, got {n1.swing_type} & {n2.swing_type}")
+            raise ValueError(f"need one swing_high and one swing_low, got "
+                             f"{n1.swing_type} & {n2.swing_type}")
         return (n1, n2) if n1.swing_type == "swing_low" else (n2, n1)
 
     def _max_pips_for(self, symbol: str) -> float:
@@ -164,7 +164,8 @@ class ConsolidationDetector:
             zone = "premium"
 
         eq_price = fib.equilibrium_price
-        touches_eq = sum(1 for c in between if c.low <= eq_price + tol and c.high >= eq_price - tol)
+        touches_eq = sum(1 for c in between
+                         if c.low <= eq_price + tol and c.high >= eq_price - tol)
 
         false_moves = 0
         for i in range(1, len(between)):

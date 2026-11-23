@@ -1,122 +1,74 @@
 # src/conditions/condition_0.py
 """
-Condition0 — lot-sizing authority.
+Condition0 — sizing / symbol universe gate.
 
-One job: given a symbol, return its minimum lot size.
-That is the only lot we ever send.
+Two responsibilities:
+  1. size(symbol) → the lot to trade. Today, always the symbol's minimum.
+  2. is_known(symbol) → is it in the auto-trade universe?
 
-Universe: `is_known` accepts a symbol if it's in the static market_watch
-set OR in the live provider (e.g. MarketWatch.universe). This lets the
-engine scan the whole live universe without the static list going stale.
+    from src.config.auto_trade import auto_trade_config
 
-Public API:
-    is_known(symbol)        → bool   (in Market Watch — static or live)
-    is_auto_trade(symbol)   → bool   (in auto-trade universe)
-    can_trade(symbol)       → bool   (mode AUTO + known + auto-trade)
-    size(symbol)            → float  (always the symbol's min lot)
-    lot_contract(symbol)    → dict   (just {'min_lot': …})
-    check(data)             → bool   (gate shim; delegates to can_trade)
-    reason(data)            → str    (human-readable failure reason)
+    c0 = Condition0(market_watch=auto_trade_config.auto_trade_symbols)
+    c0.size("XAUUSDm")          # 0.01
+    c0.is_known("XAUUSDm")      # True
 """
 from __future__ import annotations
 
 from typing import Callable, Iterable, Optional
 
-from src.config.auto_trade import auto_trade_config, TradeMode
+from src.config.auto_trade import auto_trade_config
+from src.config.settings import settings
 
 
 class Condition0:
+    """Sizing + symbol universe. No MT5 calls. No MarketWatch needed."""
+
     def __init__(
         self,
-        market_watch: Optional[Iterable[str]] = None,
-        *,
-        symbols_provider: Optional[Callable[[], object]] = None,
+        market_watch: Iterable[str] | None = None,
+        symbols_provider: Optional[Callable[[], Iterable[str]]] = None,
         name: str = "condition_0",
-        enforce_auto_trade: bool = True,
     ):
+        """
+        market_watch     — static allow-list (e.g. auto_trade_config.auto_trade_symbols)
+        symbols_provider — callable that returns the *live* tradable universe
+                           (e.g. marketwatch.tradable_symbols). Used by is_known.
+        """
         self.name = name
-        self._static = frozenset(s.upper() for s in (market_watch or []))
+        self._static: set[str] = {s.upper() for s in (market_watch or set())}
         self._provider = symbols_provider
-        self.enforce_auto_trade = enforce_auto_trade
 
-    # ── live market watch view ─────────────────────────────────────
-    @property
-    def market_watch(self) -> frozenset[str]:
-        """
-        Union of the static set and the live provider (if any).
-        Returned as an upper-cased frozenset for membership tests.
-        """
-        out = set(self._static)
+    # ── universe ────────────────────────────────────────────────
+    def is_known(self, symbol: str) -> bool:
+        """True if symbol is in the static list OR the live provider's output."""
+        s = symbol.upper()
+        if self._static and s in self._static:
+            return True
         if self._provider is not None:
             try:
-                raw = self._provider()
-                if isinstance(raw, dict):
-                    out |= {k.upper() for k in raw}
-                else:
-                    out |= {x.upper() for x in raw}
+                live = {x.upper() for x in (self._provider() or [])}
             except Exception:
-                pass
-        return frozenset(out)
+                live = set()
+            if live and s in live:
+                return True
+        return not self._static and self._provider is None  # both empty → allow
 
-    # ── universe questions ─────────────────────────────────────────
-    def is_known(self, symbol: str) -> bool:
-        return (symbol or "").upper() in self.market_watch
-
-    def is_auto_trade(self, symbol: str) -> bool:
-        s = (symbol or "").upper()
-        if not s:
-            return False
-        if not self.enforce_auto_trade:
-            return True
-        return auto_trade_config.is_auto_trade_symbol(s)
-
-    def can_trade(self, symbol: str) -> bool:
-        if auto_trade_config.mode != TradeMode.AUTO:
-            return False
-        return self.is_known(symbol) and self.is_auto_trade(symbol)
-
-    # ── lot contract ───────────────────────────────────────────────
-    def lot_contract(self, symbol: str) -> dict:
-        """Return {'min_lot'} — the lot size we send for this symbol."""
-        s = (symbol or "").upper()
-        return {"min_lot": auto_trade_config.get_min_lot(s)}
-
-    # ── sizing ─────────────────────────────────────────────────────
+    # ── sizing ──────────────────────────────────────────────────
     def size(self, symbol: str) -> float:
-        """
-        The lot size to send for `symbol`. Always the symbol's minimum.
-
-        Raises KeyError if the symbol isn't in Market Watch (static or live).
-        Raises PermissionError if it isn't in the auto-trade universe.
-        """
-        s = (symbol or "").upper()
-        if s not in self.market_watch:
-            raise KeyError(
-                f"{self.name}: symbol {symbol!r} not in Market Watch "
-                f"(static={sorted(self._static)}, live={'yes' if self._provider else 'no'})"
-            )
-        if self.enforce_auto_trade and not auto_trade_config.is_auto_trade_symbol(s):
-            raise PermissionError(
-                f"{self.name}: symbol {s!r} is not in the auto-trade universe"
-            )
+        """The lot size to trade. Always the symbol's minimum today."""
+        s = symbol.upper()
+        if not self.is_known(s):
+            raise PermissionError(f"symbol {symbol!r} not in auto-trade universe")
         return auto_trade_config.get_min_lot(s)
 
-    # ── gate interface (called by checks.py) ───────────────────────
+    # ── condition interface (for old gate callers, harmless now) ─
     def check(self, data: dict) -> bool:
-        """Gate shim. `checks.py` calls this. Delegates to can_trade()."""
-        return self.can_trade((data.get("symbol") or ""))
+        symbol = data.get("symbol", "")
+        return bool(symbol) and self.is_known(symbol)
 
-    def reason(self, data: dict) -> str | None:
-        """Human-readable reason for a failed check(). Return None if it passes."""
-        raw = data.get("symbol") or ""
-        s = raw.upper()
-        if not s:
-            return "no symbol"
-        if s not in self.market_watch:
-            # show original casing — the input was `UKOILm`, not `UKOILM`
-            return f"{raw} not in Market Watch"
-        if auto_trade_config.mode != TradeMode.AUTO:
-            return "mode is not AUTO"
-        if self.enforce_auto_trade and not auto_trade_config.is_auto_trade_symbol(s):
-            return f"{raw} not in auto-trade universe"
-        return None
+    def reason(self, data: dict) -> str:
+        symbol = data.get("symbol", "")
+        return f"symbol {symbol!r} not in auto-trade universe"
+
+
+__all__ = ["Condition0"]
