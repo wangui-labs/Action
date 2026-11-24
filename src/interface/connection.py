@@ -1,21 +1,32 @@
 # src/interface/connection.py
 """
-Connection — the single MT5 session owner.
+Connection — the single MT5 session owner + tick event dispatcher.
 
     conn = Connection()
-    conn._startup()          # initialize + verify terminal + account
-    conn.on_tick(fn)         # register per-loop tick callback
-    conn.run_loop()          # blocking loop until stop / Ctrl+C
+    conn._startup()                       # initialize + verify terminal + account
+    conn.watch("XAUUSDm")                 # symbols the loop should track
+    conn.on_tick(fn)                      # fn(symbol: str, tick: dict) -> None
+    conn.run_loop()                       # blocking; emits on NEW ticks only
     conn.disconnect()
 
 Nothing else in the project should call mt5.initialize/shutdown.
+
+Event semantics
+---------------
+MT5's Python API has no push feed — the terminal is queried synchronously.
+So this loop polls `symbol_info_tick()` cheaply, and only *emits* a tick
+event when `tick.time_msc` advances for that symbol. Subscribers therefore
+see one event per real tick, not one per loop iteration.
 """
 from __future__ import annotations
 
+import logging
 import time
 from typing import Callable, Optional
 
 import MetaTrader5 as mt5
+
+log = logging.getLogger(__name__)
 
 
 class MT5ConnectionError(RuntimeError):
@@ -27,13 +38,18 @@ class MT5ConnectionError(RuntimeError):
         super().__init__(f"{action} failed [{code}]: {message}")
 
 
+TickCallback = Callable[[str, dict], None]
+
+
 class Connection:
-    """Owns the MT5 python bridge. Callbacks fire every loop tick."""
+    """Owns the MT5 python bridge. Emits one event per *new* tick per symbol."""
 
     def __init__(self):
         self._connected: bool = False
-        self._ticks: list[Callable[[], None]] = []
-        self._loop_sleep_s: float = 0.05    # 20 Hz
+        self._tick_callbacks: list[TickCallback] = []
+        self._symbols: set[str] = set()
+        self._last_tick_msc: dict[str, int] = {}
+        self._loop_sleep_s: float = 0.02       # 50 Hz poll of the cache
         self._stopping: bool = False
 
     # ── state ──────────────────────────────────────────────────
@@ -73,16 +89,39 @@ class Connection:
             mt5.shutdown()
             self._connected = False
 
-    # ── tick callbacks + loop ──────────────────────────────────
-    def on_tick(self, fn: Callable[[], None]) -> None:
-        """Register a callback invoked every loop tick. Order preserved."""
-        if fn not in self._ticks:
-            self._ticks.append(fn)
+    # ── subscription ───────────────────────────────────────────
+    def watch(self, *symbols: str) -> None:
+        """
+        Register symbols the loop should poll for ticks.
+        Calling multiple times is additive; safe with no symbols.
+        """
+        for sym in symbols:
+            if sym:
+                self._symbols.add(sym)
 
+    def unwatch(self, *symbols: str) -> None:
+        for sym in symbols:
+            self._symbols.discard(sym)
+            self._last_tick_msc.pop(sym, None)
+
+    def on_tick(self, fn: TickCallback) -> None:
+        """
+        Register a callback invoked once per *new* tick.
+
+        Signature: fn(symbol: str, tick: dict) -> None
+        tick = {"bid": float, "ask": float, "time": int, "time_msc": int}
+        Callbacks fire in registration order; one raising does not
+        block the others.
+        """
+        if fn not in self._tick_callbacks:
+            self._tick_callbacks.append(fn)
+
+    # ── loop ───────────────────────────────────────────────────
     def run_loop(self, sleep_s: Optional[float] = None) -> None:
         """
-        Blocking loop. Calls each registered tick callback, then sleeps.
-        Stop via KeyboardInterrupt or conn.stop().
+        Blocking loop. On every iteration, polls watched symbols and
+        emits tick events only when time_msc advanced. Stops on
+        KeyboardInterrupt or conn.stop().
         """
         if not self._connected:
             raise MT5ConnectionError("run_loop", -1, "not connected")
@@ -90,13 +129,7 @@ class Connection:
         self._stopping = False
         try:
             while not self._stopping:
-                for fn in self._ticks:
-                    try:
-                        fn()
-                    except Exception as e:
-                        name = getattr(fn, "__name__", repr(fn))
-                        print(f"[loop] {name} raised {type(e).__name__}: {e}",
-                              flush=True)
+                self._emit_new_ticks()
                 time.sleep(interval)
         finally:
             self._stopping = False
@@ -104,3 +137,26 @@ class Connection:
     def stop(self) -> None:
         """Ask run_loop to exit after the current tick."""
         self._stopping = True
+
+    # ── internals ──────────────────────────────────────────────
+    def _emit_new_ticks(self) -> None:
+        for sym in tuple(self._symbols):
+            tick = mt5.symbol_info_tick(sym)
+            if tick is None:
+                continue
+            # Dedupe: emit only when time_msc advances.
+            if self._last_tick_msc.get(sym) == tick.time_msc:
+                continue
+            self._last_tick_msc[sym] = tick.time_msc
+            payload = {
+                "bid": tick.bid,
+                "ask": tick.ask,
+                "time": int(tick.time),
+                "time_msc": int(tick.time_msc),
+            }
+            for fn in self._tick_callbacks:
+                try:
+                    fn(sym, payload)
+                except Exception:
+                    name = getattr(fn, "__name__", repr(fn))
+                    log.exception("[loop] tick callback %s failed", name)

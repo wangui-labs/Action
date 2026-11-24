@@ -28,7 +28,7 @@ conn = Connection()
 conn._startup()
 
 # ── Stage 2: interface objects ─────────────────────────────────
-mw    = MarketWatch(conn)      # read-only symbol metadata
+mw    = MarketWatch()          # stateless — reads mt5 directly, no conn needed
 acc   = Account()              # stateless cache
 pos   = Position()             # stateless cache
 order = Order()                # pure executor

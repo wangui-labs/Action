@@ -2,7 +2,9 @@
 """
 MarketWatch — symbol metadata: info, tick, snapshot, open-status, universe.
 
-    mw = MarketWatch(conn)
+Stateless: no Connection, no instance state. Every call talks to mt5 directly.
+
+    mw = MarketWatch()
 
     mw.tick("XAUUSDm")         → {"bid": ..., "ask": ..., "time": ...}
     mw.snapshot("XAUUSDm")     → SymbolSnapshot (frozen)
@@ -17,7 +19,8 @@ from typing import Optional
 
 import MetaTrader5 as mt5
 
-from src.interface.connection import Connection
+# NOTE: no `from src.interface.connection import Connection` — main.py owns the
+# connection lifecycle (mt5.initialize / mt5.shutdown). MarketWatch just reads.
 
 
 @dataclass(frozen=True)
@@ -38,10 +41,10 @@ class SymbolSnapshot:
 
 
 class MarketWatch:
-    """Read-only symbol metadata. Never owns the Connection (main.py does)."""
+    """Read-only, stateless symbol metadata. Never owns the Connection."""
 
-    def __init__(self, connection: Connection):
-        self._conn = connection
+    def __init__(self) -> None:
+        pass  # kept for backward compat: MarketWatch() with no args
 
     # ── raw passthroughs ───────────────────────────────────────
     def info(self, symbol: str):

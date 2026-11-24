@@ -2,15 +2,18 @@
 """
 Position — cached MT5 position/order/deal state. Stateless w.r.t. Connection.
 
-    pos = Position()                  # no conn
-    pos.refresh(force=True)
+    pos = Position()                          # no conn
+    pos.refresh(force=True)                   # full pull
+    pos.refresh("XAUUSDm", tick)              # tick-driven, symbol-filtered
     pos.active() / pos.pending() / pos.closed()
 
 main.py wires the refresh:
 
-    conn.on_tick(pos.refresh)
+    conn.watch("XAUUSDm")
+    conn.on_tick(pos.refresh)                 # (sym, tick) → throttled
 
-Mutations (modify_sl_tp, close, cancel_order) call MT5 directly.
+Mutations (modify_sl_tp, close, cancel_order) call MT5 directly and
+force a refresh so the cache is consistent after the mutation.
 """
 from __future__ import annotations
 
@@ -45,7 +48,30 @@ class Position:
         self._history_interval_s = history_interval_s
         self.refresh(force=True)
 
-    def refresh(self, force: bool = False) -> None:
+    # ── event handler ──────────────────────────────────────────
+    def refresh(
+        self,
+        symbol: Optional[str] = None,
+        tick: Optional[dict] = None,
+        force: bool = False,
+    ) -> None:
+        """
+        Tick subscriber. `(symbol, tick)` come from Connection.on_tick.
+
+        Fast path: if a symbol is given and we hold nothing on it,
+        skip the active/pending pull — the cache only changes when a
+        price moves on a position or order we actually own.
+
+        When `symbol is None` (direct/manual call), no filtering is
+        applied — same as the original behaviour.
+        """
+        # Symbol-scoped event: skip if nothing we hold moves on this symbol.
+        if not force and symbol is not None:
+            held_symbols = {p["symbol"] for p in self._active}
+            held_symbols |= {o["symbol"] for o in self._pending}
+            if held_symbols and symbol not in held_symbols:
+                return
+
         now = time.time()
         if force or (now - self._last_active_ts) >= self._active_interval_s:
             self._last_active_ts = now
@@ -55,6 +81,7 @@ class Position:
             self._last_history_ts = now
             self._refresh_closed()
 
+    # ── pulls ──────────────────────────────────────────────────
     def _refresh_active(self) -> None:
         try:
             raw = mt5.positions_get() or []
@@ -79,14 +106,19 @@ class Position:
         except Exception as e:
             print(f"[Position] history refresh failed: {e}")
             return
-        deals = [d._asdict() for d in raw
-                 if d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT)]
+        deals = [
+            d._asdict() for d in raw
+            if d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT)
+        ]
         deals.sort(key=lambda d: d.get("time", 0), reverse=True)
         self._closed = deals[: self._history_limit]
 
     # ── active ──────────────────────────────────────────────────
-    def active(self, symbol: Optional[str] = None,
-               magic: Optional[int] = None) -> list[dict]:
+    def active(
+        self,
+        symbol: Optional[str] = None,
+        magic: Optional[int] = None,
+    ) -> list[dict]:
         out = self._active
         if symbol:
             out = [p for p in out if p["symbol"] == symbol]
@@ -94,8 +126,11 @@ class Position:
             out = [p for p in out if p["magic"] == magic]
         return out
 
-    def all(self, symbol: Optional[str] = None,
-            magic: Optional[int] = None) -> list[dict]:
+    def all(
+        self,
+        symbol: Optional[str] = None,
+        magic: Optional[int] = None,
+    ) -> list[dict]:
         return self.active(symbol=symbol, magic=magic)
 
     def get(self, ticket: int) -> Optional[dict]:
@@ -110,14 +145,19 @@ class Position:
             return None
         is_long = pos["type"] == mt5.POSITION_TYPE_BUY
         return {
-            "ticket": pos["ticket"], "symbol": pos["symbol"],
+            "ticket": pos["ticket"],
+            "symbol": pos["symbol"],
             "side": "long" if is_long else "short",
             "entry": pos["price_open"],
-            "sl_price": pos["sl"], "tp_price": pos["tp"],
-            "volume": pos["volume"], "profit": pos["profit"],
-            "swap": pos["swap"], "commission": pos.get("commission", 0.0),
+            "sl_price": pos["sl"],
+            "tp_price": pos["tp"],
+            "volume": pos["volume"],
+            "profit": pos["profit"],
+            "swap": pos["swap"],
+            "commission": pos.get("commission", 0.0),
             "current_price": pos["price_current"],
-            "magic": pos["magic"], "comment": pos["comment"],
+            "magic": pos["magic"],
+            "comment": pos["comment"],
         }
 
     def pnl(self, ticket: int) -> Optional[float]:
@@ -126,12 +166,18 @@ class Position:
             return None
         return pos["profit"] + pos["swap"] + pos.get("commission", 0.0)
 
-    def count(self, symbol: Optional[str] = None,
-              magic: Optional[int] = None) -> int:
+    def count(
+        self,
+        symbol: Optional[str] = None,
+        magic: Optional[int] = None,
+    ) -> int:
         return len(self.active(symbol=symbol, magic=magic))
 
-    def total_lots(self, symbol: Optional[str] = None,
-                   magic: Optional[int] = None) -> float:
+    def total_lots(
+        self,
+        symbol: Optional[str] = None,
+        magic: Optional[int] = None,
+    ) -> float:
         return sum(p["volume"] for p in self.active(symbol=symbol, magic=magic))
 
     # ── pending ─────────────────────────────────────────────────
@@ -163,8 +209,12 @@ class Position:
         return None
 
     # ── mutations ───────────────────────────────────────────────
-    def modify_sl_tp(self, ticket: int, sl: Optional[float] = None,
-                     tp: Optional[float] = None) -> dict:
+    def modify_sl_tp(
+        self,
+        ticket: int,
+        sl: Optional[float] = None,
+        tp: Optional[float] = None,
+    ) -> dict:
         pos = self.get(ticket)
         if pos is None:
             raise PositionError("modify", -1, f"position {ticket} not found")
@@ -173,14 +223,20 @@ class Position:
         new_tp = float(tp) if tp is not None else float(pos["tp"])
         req = {
             "action": mt5.TRADE_ACTION_SLTP,
-            "symbol": pos["symbol"], "position": int(ticket),
-            "sl": new_sl, "tp": new_tp,
+            "symbol": pos["symbol"],
+            "position": int(ticket),
+            "sl": new_sl,
+            "tp": new_tp,
             "magic": int(pos.get("magic", 0)),
         }
         self._send(req, "modify_sl_tp")
         self.refresh(force=True)
-        return {"retcode": mt5.TRADE_RETCODE_DONE,
-                "ticket": ticket, "sl": new_sl, "tp": new_tp}
+        return {
+            "retcode": mt5.TRADE_RETCODE_DONE,
+            "ticket": ticket,
+            "sl": new_sl,
+            "tp": new_tp,
+        }
 
     def breakeven(self, ticket: int) -> dict:
         pos = self.get(ticket)
@@ -188,17 +244,22 @@ class Position:
             raise PositionError("breakeven", -1, f"position {ticket} not found")
         return self.modify_sl_tp(ticket, sl=pos["price_open"])
 
-    def close(self, ticket: int, lot: Optional[float] = None,
-              comment: str = "") -> dict:
+    def close(
+        self,
+        ticket: int,
+        lot: Optional[float] = None,
+        comment: str = "",
+    ) -> dict:
         pos = self.get(ticket)
         if pos is None:
             raise PositionError("close", -1, f"position {ticket} not found")
 
         volume = float(lot) if lot is not None else float(pos["volume"])
         if volume <= 0 or volume > pos["volume"]:
-            raise PositionError("close", -1,
-                                f"invalid close volume {volume} "
-                                f"(position has {pos['volume']})")
+            raise PositionError(
+                "close", -1,
+                f"invalid close volume {volume} (position has {pos['volume']})",
+            )
 
         is_long = pos["type"] == mt5.POSITION_TYPE_BUY
         tick = mt5.symbol_info_tick(pos["symbol"])
@@ -208,10 +269,12 @@ class Position:
 
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": pos["symbol"], "position": int(ticket),
+            "symbol": pos["symbol"],
+            "position": int(ticket),
             "volume": volume,
             "type": mt5.ORDER_TYPE_SELL if is_long else mt5.ORDER_TYPE_BUY,
-            "price": float(price), "deviation": 20,
+            "price": float(price),
+            "deviation": 20,
             "magic": int(pos.get("magic", 0)),
             "comment": comment or "close",
             "type_time": mt5.ORDER_TIME_GTC,
@@ -219,11 +282,18 @@ class Position:
         }
         self._send(req, "close")
         self.refresh(force=True)
-        return {"retcode": mt5.TRADE_RETCODE_DONE,
-                "ticket": ticket, "price": price, "volume": volume}
+        return {
+            "retcode": mt5.TRADE_RETCODE_DONE,
+            "ticket": ticket,
+            "price": price,
+            "volume": volume,
+        }
 
-    def close_all(self, symbol: Optional[str] = None,
-                  magic: Optional[int] = None) -> list[dict]:
+    def close_all(
+        self,
+        symbol: Optional[str] = None,
+        magic: Optional[int] = None,
+    ) -> list[dict]:
         out = []
         for pos in list(self.active(symbol=symbol, magic=magic)):
             try:
@@ -235,8 +305,10 @@ class Position:
     def cancel_order(self, ticket: int) -> dict:
         if self.get_order(ticket) is None:
             raise PositionError("cancel", -1, f"order {ticket} not found")
-        self._send({"action": mt5.TRADE_ACTION_REMOVE, "order": int(ticket)},
-                   "cancel_order")
+        self._send(
+            {"action": mt5.TRADE_ACTION_REMOVE, "order": int(ticket)},
+            "cancel_order",
+        )
         self.refresh(force=True)
         return {"retcode": mt5.TRADE_RETCODE_DONE, "ticket": ticket}
 
@@ -245,13 +317,19 @@ class Position:
     def _send(request: dict, action: str) -> None:
         check = mt5.order_check(request)
         if check is None or check.retcode != 0:
-            code, msg = (mt5.last_error() if check is None
-                         else (check.retcode, check.comment))
-            raise PositionError(f"{action}:check", code,
-                                msg or "pre-trade check failed")
+            code, msg = (
+                mt5.last_error()
+                if check is None
+                else (check.retcode, check.comment)
+            )
+            raise PositionError(
+                f"{action}:check", code, msg or "pre-trade check failed",
+            )
         result = mt5.order_send(request)
         if result is None:
             code, msg = mt5.last_error()
             raise PositionError(f"{action}:send", code, msg)
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            raise PositionError(f"{action}:send", result.retcode, result.comment)
+            raise PositionError(
+                f"{action}:send", result.retcode, result.comment,
+            )
