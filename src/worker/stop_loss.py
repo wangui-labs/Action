@@ -1,308 +1,329 @@
 # src/worker/stop_loss.py
 """
-StopLossWorker — stateless SL manager.
+StopLossWorker — stateless SL/TP manager.
 
-Called from main.py as ONE LINE:
+main.py calls exactly ONE line:
 
-    sl = StopLossWorker.start(mw, stop)
+    from src.worker.stop_loss import start as start_stop_loss
+    sl = start_stop_loss(mw, stop)
 
-Everything else — Condition0 (sizing), Condition1 (SL math), the poll loop,
-the daemon thread — is built and owned inside this file. main.py never sees
-Condition0, Condition1, auto_trade_config, or settings.execution.
-
-For manual control instead of a thread:
-
-    c0 = Condition0(market_watch=auto_trade_config.auto_trade_symbols)
-    c1 = Condition1(marketwatch=mw, sizing=c0)
-    sl = StopLossWorker(condition1=c1)
-    sl.process()                       # one pass, no thread
-
-No Connection. No Position. No MarketWatch attribute. The worker reads
-mt5.positions_get() directly (same as before) and delegates all math to
-Condition1 (which holds its own MarketWatch reference internally).
+Policy comes from src/worker/sl_policy.py. Interval defaults to 10s.
+To change behavior, edit SLPolicy defaults — don't touch this file
+or main.py.
 """
 from __future__ import annotations
 
 import threading
 import time
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Optional
 
-import MetaTrader5 as mt5
+import MetaTrader5 as mt5  # type: ignore[import]
 
-from src.config.settings import settings
-from src.conditions.condition_1 import Condition1
-
-
-BreachPolicy = Literal["widen", "close", "skip"]
+from src.interface.marketwatch import MarketWatch
+from src.worker.sl_policy import SLPolicy
 
 
-@dataclass
-class ManagedPosition:
+# ═══════════════════════════════════════════════════════════════════
+# PositionView — frozen snapshot, built fresh each pass
+# ═══════════════════════════════════════════════════════════════════
+@dataclass(frozen=True, slots=True)
+class PositionView:
     ticket: int
     symbol: str
-    side: str
+    is_long: bool
+    volume: float
     entry: float
-    initial_risk: float
-    stage: str = "initial"
-    last_sl: float = 0.0
-    last_attach_attempt: float = 0.0
+    current: float
+    sl: float
+    tp: float
+    magic: int
+
+    @property
+    def side_sign(self) -> int:
+        return 1 if self.is_long else -1
+
+    @property
+    def initial_risk(self) -> float:
+        return abs(self.entry - self.sl) if self.sl > 0 else 0.0
+
+    @property
+    def r_multiple(self) -> float:
+        risk = self.initial_risk
+        if risk <= 0:
+            return 0.0
+        return (self.current - self.entry) * self.side_sign / risk
 
 
+# ═══════════════════════════════════════════════════════════════════
+# StopLossWorker — the implementation
+# ═══════════════════════════════════════════════════════════════════
 class StopLossWorker:
-    """Stateless SL manager. main.py calls .start(mw, stop) or .process()."""
+    """Stateless SL/TP manager. Never instantiated directly by main.py."""
 
-    def __init__(
-        self,
-        condition1: Condition1,
-        *,
-        auto_magics: Optional[set[int]] = None,
-        manage_manual: Optional[bool] = None,
-    ):
-        self.condition1 = condition1
-        self.auto_magics = set(auto_magics if auto_magics is not None
-                               else {settings.influence.magic})
-        self.manage_manual = (manage_manual if manage_manual is not None
-                              else settings.manage_manual)
+    def __init__(self, marketwatch: MarketWatch, *,
+                 policy: Optional[SLPolicy] = None,
+                 interval_s: float = 10.0):
+        self.mw = marketwatch
+        self.policy = policy or SLPolicy()
+        self.interval_s = interval_s
 
-        # per-ticket bookkeeping (state, not connection state)
-        self._managed: dict[int, ManagedPosition] = {}
-        self._last_process_time: float = 0.0
+    # ── public — one pass over all positions ─────────────────────
+    def process(self) -> None:
+        raw = mt5.positions_get()
+        if raw is None:
+            return
+        for mt5_pos in raw:
+            try:
+                view = self._view_from(mt5_pos)
+                if view is None:
+                    continue
+                if not self._should_manage(view):
+                    continue
+                self._manage_one(view)
+            except Exception as e:
+                symbol = getattr(mt5_pos, "symbol", "?")
+                ticket = getattr(mt5_pos, "ticket", "?")
+                self._log(f"{symbol} ticket={ticket}: manage error — "
+                          f"{type(e).__name__}: {e}")
 
-    # ═══════════════════════════════════════════════════════════════
-    # One-line API — main.py calls exactly this
-    # ═══════════════════════════════════════════════════════════════
-    @classmethod
-    def start(
-        cls,
-        marketwatch,
-        stop_event: threading.Event,
-        *,
-        auto_magics: Optional[set[int]] = None,
-        manage_manual: Optional[bool] = None,
-        interval_s: Optional[float] = None,
-    ) -> "StopLossWorker":
-        """
-        Build everything the worker needs, then start it on a daemon thread.
-
-            sl = StopLossWorker.start(mw, stop)
-
-        All defaults come from settings. Override via kwargs if needed.
-        Returns the worker so callers can call sl.process() manually.
-        """
-        # local imports — keep module import cost low, avoid cycles
-        from src.conditions.condition_0 import Condition0
-        from src.config.auto_trade import auto_trade_config
-
-        c0 = Condition0(market_watch=auto_trade_config.auto_trade_symbols)
-        c1 = Condition1(marketwatch=marketwatch, sizing=c0)
-
-        worker = cls(
-            condition1=c1,
-            auto_magics=auto_magics,
-            manage_manual=manage_manual,
-        )
-
-        poll_s = (interval_s if interval_s is not None
-                  else settings.execution.sl_tick_interval_s)
-
-        threading.Thread(
-            target=worker._run_loop,
-            args=(stop_event, poll_s),
-            daemon=True,
-        ).start()
-
-        return worker
-
-    def _run_loop(self, stop_event: threading.Event, interval_s: float) -> None:
-        """Internal poll loop. Not called by main.py directly."""
-        print(f"[StopLoss] armed — every {interval_s}s, "
-              f"magics={sorted(self.auto_magics)}, "
-              f"manage_manual={self.manage_manual}", flush=True)
+    # ── internal loop ────────────────────────────────────────────
+    def _run_loop(self, stop_event: threading.Event) -> None:
+        print(f"[StopLoss] armed — every {self.interval_s}s, "
+              f"magics={sorted(self.policy.magics)}, "
+              f"manage_manual={self.policy.manage_manual}, "
+              f"risk=${self.policy.risk_usd}, "
+              f"rr={self.policy.rr_ratio}, "
+              f"be_at_r={self.policy.be_at_r}",
+              flush=True)
         while not stop_event.is_set():
             try:
                 self.process()
             except Exception as e:
                 print(f"[StopLoss] process error — {type(e).__name__}: {e}",
                       flush=True)
-            time.sleep(interval_s)
+            time.sleep(self.interval_s)
 
-    # ═══════════════════════════════════════════════════════════════
-    # Public API — one full pass over all positions
-    # ═══════════════════════════════════════════════════════════════
-    def process(self) -> None:
-        """One full pass over all open positions. Idempotent, safe to call often."""
-        self.condition1.begin_tick()
-        try:
-            positions = self._open_positions()
-            for pos in positions:
-                if not self._should_manage(pos):
-                    continue
-                try:
-                    self._manage_one(pos)
-                except Exception as e:
-                    self._log(f"{pos.get('symbol')} ticket={pos.get('ticket')}: "
-                              f"manage error — {type(e).__name__}: {e}")
-        finally:
-            self.condition1.end_tick()
+    # ── view construction ────────────────────────────────────────
+    def _view_from(self, mt5_pos) -> Optional[PositionView]:
+        tick = self.mw.tick(mt5_pos.symbol)
+        is_long = mt5_pos.type == 0
+        current = tick["bid"] if is_long else tick["ask"]
+        return PositionView(
+            ticket=int(mt5_pos.ticket),
+            symbol=mt5_pos.symbol,
+            is_long=is_long,
+            volume=float(mt5_pos.volume),
+            entry=float(mt5_pos.price_open),
+            current=float(current),
+            sl=float(mt5_pos.sl or 0.0),
+            tp=float(mt5_pos.tp or 0.0),
+            magic=int(mt5_pos.magic or 0),
+        )
 
-        # forget positions that no longer exist
-        live_tickets = {int(p["ticket"]) for p in positions}
-        for ticket in list(self._managed.keys()):
-            if ticket not in live_tickets:
-                self._managed.pop(ticket, None)
-
-        self._last_process_time = time.time()
-
-    # ═══════════════════════════════════════════════════════════════
-    # Internals
-    # ═══════════════════════════════════════════════════════════════
-    def _open_positions(self) -> list[dict]:
-        raw = mt5.positions_get()
-        if raw is None:
-            return []
-        return [p._asdict() for p in raw]
-
-    def _should_manage(self, pos: dict) -> bool:
-        magic = int(pos.get("magic", 0))
-        if magic in self.auto_magics:
+    def _should_manage(self, v: PositionView) -> bool:
+        if v.magic in self.policy.magics:
             return True
-        return self.manage_manual and magic == 0
+        return self.policy.manage_manual and v.magic == 0
 
-    def _manage_one(self, pos: dict) -> None:
-        ticket = int(pos["ticket"])
-        symbol = pos["symbol"]
-        state = self._managed.get(ticket)
-
-        if state is None:
-            entry = float(pos["price_open"])
-            initial_sl = float(pos.get("sl", 0.0))
-            initial_risk = abs(entry - initial_sl) if initial_sl > 0 else 0.0
-            state = ManagedPosition(
-                ticket=ticket,
-                symbol=symbol,
-                side="long" if int(pos["type"]) == 0 else "short",
-                entry=entry,
-                initial_risk=initial_risk,
-                stage="initial",
-                last_sl=initial_sl,
-            )
-            self._managed[ticket] = state
-
-        # Condition1 holds its own MarketWatch reference — no mw needed here.
-        tick = self.condition1.marketwatch.tick(symbol)
-        is_long = int(pos["type"]) == 0
-        price = tick["bid"] if is_long else tick["ask"]
-
-        current_sl = float(pos.get("sl", 0.0))
-
-        # 1. breach handling first — SL already crossed
-        if current_sl > 0 and self.condition1.is_sl_breached(pos, current_sl):
-            self._handle_sl_breach(pos, state)
+    # ── decision tree ────────────────────────────────────────────
+    def _manage_one(self, v: PositionView) -> None:
+        # 1. Unprotected → add SL + TP
+        if v.sl <= 0 or v.tp <= 0:
+            if self.policy.initial_sl_if_missing:
+                self._place_initial_sltp(v)
             return
 
-        # 2. trailing takes priority, then breakeven
-        candidate = self.condition1.trailing_sl(pos, price)
-        if candidate is None:
-            candidate = self.condition1.breakeven_sl(pos, price)
-        if candidate is None:
+        # 2. Breach → policy handling
+        if self._is_sl_breached(v):
+            self._handle_breach(v)
             return
 
-        # 3. only apply if it's a better SL
-        if not self.condition1.better_sl(pos, candidate):
+        # 3. Breakeven
+        if v.r_multiple >= self.policy.be_at_r and not self._is_be(v):
+            self._apply_breakeven(v)
             return
 
-        self._apply_sl(pos, candidate, stage="trail_or_be")
+        # 4. Nothing to do (no trailing)
 
-    def _handle_sl_breach(self, pos: dict, state: ManagedPosition) -> None:
-        policy: str = settings.position_management.on_breach
+    # ── actions ──────────────────────────────────────────────────
+    def _place_initial_sltp(self, v: PositionView) -> None:
+        snap = self.mw.snapshot(v.symbol)
+        sl_dist = self._risk_distance(v, snap)
+        if sl_dist is None:
+            self._log(f"{v.symbol} ticket={v.ticket}: cannot size SL "
+                      f"(tick_value={snap.tick_value}, vol={v.volume})")
+            return
 
+        sl_price = round(v.entry - sl_dist * v.side_sign, snap.digits)
+        tp_dist  = sl_dist * self.policy.rr_ratio
+        tp_price = round(v.entry + tp_dist * v.side_sign, snap.digits)
+
+        if not self._passes_min_stop(v, sl_price, snap):
+            self._log(f"{v.symbol} ticket={v.ticket}: initial SL too close "
+                      f"to market ({sl_price} vs {v.current}) — skipping")
+            return
+        if not self._passes_min_stop(v, tp_price, snap):
+            self._log(f"{v.symbol} ticket={v.ticket}: initial TP too close "
+                      f"to market ({tp_price} vs {v.current}) — skipping")
+            return
+
+        self._send_sltp(v, sl_price, tp_price, stage="initial")
+        self._log(f"{v.symbol} ticket={v.ticket}: initial SL/TP placed  "
+                  f"sl={sl_price}  tp={tp_price}  "
+                  f"risk=${self.policy.risk_usd}  rr={self.policy.rr_ratio}")
+
+    def _apply_breakeven(self, v: PositionView) -> None:
+        snap = self.mw.snapshot(v.symbol)
+        lock = v.initial_risk * self.policy.be_lock_pct
+        be_price = round(v.entry + lock * v.side_sign, snap.digits)
+
+        if not self._passes_min_stop(v, be_price, snap):
+            self._log(f"{v.symbol} ticket={v.ticket}: BE target too close "
+                      f"to market ({be_price} vs {v.current}) — holding")
+            return
+        if not self._is_better_sl(v, be_price, snap):
+            return
+
+        self._send_sltp(v, be_price, v.tp, stage="breakeven")
+        self._log(f"{v.symbol} ticket={v.ticket}: SL → breakeven {be_price}  "
+                  f"(R={v.r_multiple:+.2f})")
+
+    def _handle_breach(self, v: PositionView) -> None:
+        policy = self.policy.on_breach
         if policy == "skip":
             return
-
-        if policy == "widen":
-            widened = self.condition1.widened_sl_price(pos)
-            if widened is None:
-                return
-            self._apply_sl(pos, widened, stage="widened")
-            return
-
         if policy == "close":
-            self._close_position(pos)
+            self._close(v)
             return
+        if policy == "widen":
+            snap = self.mw.snapshot(v.symbol)
+            widened_usd = self.policy.risk_usd * self.policy.breach_multiple
+            dist = self._risk_distance(v, snap, risk_usd=widened_usd)
+            if dist is None:
+                return
+            new_sl = round(v.current - dist * v.side_sign, snap.digits)
+            if self._passes_min_stop(v, new_sl, snap):
+                self._send_sltp(v, new_sl, v.tp, stage="widened")
+                self._log(f"{v.symbol} ticket={v.ticket}: SL widened to "
+                          f"{new_sl} (policy=widen)")
 
-    def _apply_sl(self, pos: dict, new_sl: float, *, stage: str) -> None:
-        ticket = int(pos["ticket"])
-        symbol = pos["symbol"]
-        tp = float(pos.get("tp", 0.0))
+    # ── math (was Condition1) ────────────────────────────────────
+    def _risk_distance(self, v: PositionView, snap, *,
+                       risk_usd: Optional[float] = None) -> Optional[float]:
+        usd = risk_usd if risk_usd is not None else self.policy.risk_usd
+        denom = snap.tick_value * max(v.volume, 1e-9)
+        if denom <= 0:
+            return None
+        points = usd / denom
+        return points * snap.tick_size
 
+    def _passes_min_stop(self, v: PositionView, price: float, snap) -> bool:
+        if not self.policy.enforce_min_stop:
+            return True
+        min_dist = (snap.stops_level_points or 10) * snap.point
+        return abs(price - v.current) >= min_dist
+
+    def _is_sl_breached(self, v: PositionView) -> bool:
+        if v.sl <= 0:
+            return False
+        return (v.is_long and v.current <= v.sl) or \
+               (not v.is_long and v.current >= v.sl)
+
+    def _is_be(self, v: PositionView) -> bool:
+        lock = v.entry + v.initial_risk * self.policy.be_lock_pct * v.side_sign
+        return (v.is_long and v.sl >= lock) or (not v.is_long and v.sl <= lock)
+
+    def _is_better_sl(self, v: PositionView, candidate: float, snap) -> bool:
+        if v.sl <= 0:
+            return True
+        if abs(candidate - v.sl) < snap.tick_size * 0.5:
+            return False
+        return (v.is_long and candidate > v.sl) or \
+               (not v.is_long and candidate < v.sl)
+
+    # ── broker I/O ───────────────────────────────────────────────
+    def _send_sltp(self, v: PositionView, sl: float, tp: float,
+                   *, stage: str) -> None:
         req = {
             "action": mt5.TRADE_ACTION_SLTP,
-            "symbol": symbol,
-            "position": ticket,
-            "sl": float(new_sl),
-            "tp": tp,
-            "magic": int(pos.get("magic", 0)),
+            "symbol": v.symbol,
+            "position": v.ticket,
+            "sl": float(sl),
+            "tp": float(tp),
+            "magic": v.magic,
             "comment": f"sl:{stage}",
         }
-
         result = mt5.order_send(req)  # type: ignore[arg-type]
         if result is None:
             code, msg = mt5.last_error()
-            self._log(f"{symbol} ticket={ticket}: SLTP send None [{code}]: {msg}")
+            self._log(f"{v.symbol} ticket={v.ticket}: SLTP send None "
+                      f"[{code}]: {msg}")
             return
-
         if result.retcode != mt5.TRADE_RETCODE_DONE:
-            self._log(f"{symbol} ticket={ticket}: SLTP rejected "
+            self._log(f"{v.symbol} ticket={v.ticket}: SLTP rejected "
                       f"[{result.retcode}]: {result.comment}")
-            return
 
-        state = self._managed.get(ticket)
-        if state is not None:
-            state.last_sl = new_sl
-            state.stage = stage
-            state.last_attach_attempt = time.time()
-
-        self._log(f"{symbol} ticket={ticket}: SL → {new_sl:.5f} ({stage})")
-
-    def _close_position(self, pos: dict) -> None:
-        ticket = int(pos["ticket"])
-        symbol = pos["symbol"]
-        volume = float(pos["volume"])
-        is_long = int(pos["type"]) == 0
-
-        tick = mt5.symbol_info_tick(symbol)
+    def _close(self, v: PositionView) -> None:
+        tick = self.mw.tick(v.symbol)
         if tick is None:
-            self._log(f"{symbol} ticket={ticket}: no tick, cannot close")
+            self._log(f"{v.symbol} ticket={v.ticket}: no tick, cannot close")
             return
-
         req = {
             "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "position": ticket,
-            "volume": volume,
-            "type": mt5.ORDER_TYPE_SELL if is_long else mt5.ORDER_TYPE_BUY,
-            "price": tick.bid if is_long else tick.ask,
+            "symbol": v.symbol,
+            "position": v.ticket,
+            "volume": v.volume,
+            "type": mt5.ORDER_TYPE_SELL if v.is_long else mt5.ORDER_TYPE_BUY,
+            "price": tick["bid"] if v.is_long else tick["ask"],
             "deviation": 20,
-            "magic": int(pos.get("magic", 0)),
+            "magic": v.magic,
             "comment": "sl:breach_close",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
-
         result = mt5.order_send(req)  # type: ignore[arg-type]
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
             code = result.retcode if result else -1
             msg = result.comment if result else str(mt5.last_error())
-            self._log(f"{symbol} ticket={ticket}: close rejected [{code}]: {msg}")
+            self._log(f"{v.symbol} ticket={v.ticket}: close rejected "
+                      f"[{code}]: {msg}")
             return
-
-        self._managed.pop(ticket, None)
-        self._log(f"{symbol} ticket={ticket}: closed on SL breach")
+        self._log(f"{v.symbol} ticket={v.ticket}: closed on SL breach")
 
     @staticmethod
     def _log(msg: str) -> None:
         print(f"[StopLoss] {msg}", flush=True)
 
 
-__all__ = ["StopLossWorker", "ManagedPosition", "BreachPolicy"]
+# ═══════════════════════════════════════════════════════════════════
+# Module-level API — main.py calls exactly this
+# ═══════════════════════════════════════════════════════════════════
+def start(
+    marketwatch: MarketWatch,
+    stop_event: threading.Event,
+    *,
+    interval_s: float = 10.0,
+) -> StopLossWorker:
+    """
+    Build a StopLossWorker with default policy, start it on a daemon
+    thread, and return the worker.
+
+        sl = start_stop_loss(mw, stop)
+
+    To change behavior, edit src/worker/sl_policy.py — not this call.
+    """
+    worker = StopLossWorker(
+        marketwatch,
+        policy=SLPolicy(),
+        interval_s=interval_s,
+    )
+    threading.Thread(
+        target=worker._run_loop,
+        args=(stop_event,),
+        daemon=True,
+    ).start()
+    return worker
+
+
+__all__ = ["start", "StopLossWorker", "PositionView"]

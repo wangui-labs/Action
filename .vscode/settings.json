@@ -1,3 +1,9 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:venv"
+    "workbench.startupEditor": "none",
+    "terminal.integrated.enableMultiLinePasteWarning": "never",
+    "workbench.iconTheme": "material-icon-theme",
+    "security.workspace.trust.untrustedFiles": "open",
+    "git.autofetch": true,
+    "files.autoSave": "afterDelay",
+    "python.defaultInterpreterPath": "C:\\Users\\user\\Desktop\\Action\\.venv312\\Scripts\\python.exe"
 }

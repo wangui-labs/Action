@@ -1,0 +1,7 @@
+{
+  "typeCheckingMode": "basic",
+  "reportAttributeAccessIssue": "none",
+  "extraPaths": ["."],
+  "venvPath": ".",
+  "venv": ".venv312"
+}

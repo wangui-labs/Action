@@ -11,16 +11,17 @@ Stateless: no Connection, no instance state. Every call talks to mt5 directly.
     mw.info("XAUUSDm")         → raw mt5 symbol_info (dict-like)
     mw.tradable_symbols()      → list[str]
     mw.is_open("XAUUSDm")      → bool
+
+Hidden symbols (broker offers them but they are not selected in Market Watch)
+are auto-selected on first read via mt5.symbol_select(symbol, True), which is
+the canonical MT5 API for making a symbol available to the terminal session.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
 
-import MetaTrader5 as mt5
-
-# NOTE: no `from src.interface.connection import Connection` — main.py owns the
-# connection lifecycle (mt5.initialize / mt5.shutdown). MarketWatch just reads.
+import MetaTrader5 as mt5  # type: ignore[import]
 
 
 @dataclass(frozen=True)
@@ -46,20 +47,41 @@ class MarketWatch:
     def __init__(self) -> None:
         pass  # kept for backward compat: MarketWatch() with no args
 
-    # ── raw passthroughs ───────────────────────────────────────
+    # ── internal: make a hidden symbol visible in Market Watch ──
+    @staticmethod
+    def _ensure(symbol: str) -> bool:
+        """
+        True if the symbol is resolvable after possibly selecting it into
+        Market Watch. MT5 needs a symbol to be *selected* for symbol_info
+        and symbol_info_tick to return data — even if the broker offers it.
+        Idempotent: selecting an already-selected symbol is a no-op.
+        """
+        if mt5.symbol_info(symbol) is not None:
+            return True
+        if mt5.symbol_select(symbol, True):
+            return mt5.symbol_info(symbol) is not None
+        return False
+
+    # ── raw passthroughs (all guarded) ──────────────────────────
     def info(self, symbol: str):
+        if not self._ensure(symbol):
+            raise KeyError(f"symbol {symbol!r} not found")
         info = mt5.symbol_info(symbol)
-        if info is None:
+        if info is None:                          # defensive; _ensure said it's there
             raise KeyError(f"symbol {symbol!r} not found")
         return info
 
     def tick(self, symbol: str) -> dict:
+        if not self._ensure(symbol):
+            raise KeyError(f"symbol {symbol!r} not found")
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             raise KeyError(f"no tick for {symbol!r}")
         return {"bid": tick.bid, "ask": tick.ask, "time": int(tick.time)}
 
     def is_open(self, symbol: str) -> bool:
+        if not self._ensure(symbol):
+            return False
         info = mt5.symbol_info(symbol)
         if info is None:
             return False
