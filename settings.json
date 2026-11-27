@@ -1,9 +1,0 @@
-{
-    "workbench.startupEditor": "none",
-    "terminal.integrated.enableMultiLinePasteWarning": "never",
-    "workbench.iconTheme": "material-icon-theme",
-    "security.workspace.trust.untrustedFiles": "open",
-    "python.analysis.typeCheckingMode": "basic",
-    "git.autofetch": true,
-    "files.autoSave": "afterDelay"
-}

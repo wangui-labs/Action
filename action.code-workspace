@@ -1,0 +1,14 @@
+{
+  "folders": [
+    { "path": "." }
+  ],
+  "settings": {
+    "python.defaultInterpreterPath": "C:\\Users\\user\\Desktop\\Action\\.venv312\\Scripts\\python.exe",
+    "python.analysis.extraPaths": ["C:\\Users\\user\\Desktop\\Action"],
+    "python.analysis.typeCheckingMode": "basic",
+    "python.analysis.diagnosticSeverityOverrides": {
+      "reportMissingImports": "none",
+      "reportAttributeAccessIssue": "none"
+    }
+  }
+}
